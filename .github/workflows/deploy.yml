@@ -1,34 +1,104 @@
 name: Deploy
+
+# Despliegue continuo: en cada cambio a main, todos los días y de forma manual.
 on:
   push:
     branches: [main]
   schedule:
     - cron: "0 12 * * *"   # todos los días 7:00 a. m. Colombia
   workflow_dispatch:
+
 permissions:
   contents: read
-  pages: write
-  id-token: write
+
+# Un solo despliegue a la vez; el que está en curso termina antes de iniciar otro.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Pruebas, scraping y verificación
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - run: python -m pytest -q
-      - run: python main.py
+      - name: Pruebas (puerta de calidad)
+        run: python -m pytest -q
+      - name: Ejecutar el scraper
+        run: python main.py
+      - name: Verificar la salida antes de publicar
+        run: python -m src.verificacion site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+
   deploy:
+    name: Publicar en GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  verificar-produccion:
+    name: Comprobar el sitio publicado
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Esperar respuesta 200 y contenido esperado
+        env:
+          URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          for intento in 1 2 3 4 5; do
+            codigo=$(curl -s -o pagina.html -w "%{http_code}" "$URL" || true)
+            if [ "$codigo" = "200" ] && grep -q "Catálogo" pagina.html; then
+              echo "Sitio operativo en $URL"
+              exit 0
+            fi
+            echo "Intento $intento: HTTP $codigo; reintentando en 15 s..."
+            sleep 15
+          done
+          echo "El sitio publicado no respondió correctamente: $URL"
+          exit 1
+
+  notificar-fallo:
+    name: Abrir issue si falla el despliegue
+    needs: [build, deploy, verificar-produccion]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const titulo = "Falló el despliegue automático";
+            const abiertos = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: "despliegue", per_page: 50,
+            });
+            if (abiertos.data.some(i => i.title === titulo)) return;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: titulo, labels: ["despliegue"],
+              body: `El workflow **Deploy** falló.\n\nRevisa la ejecución: ${run}\n\n` +
+                    "Causas frecuentes: el sitio cambió su HTML/JSON, no respondió o las pruebas fallaron.",
+            });
