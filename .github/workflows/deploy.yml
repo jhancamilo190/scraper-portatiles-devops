@@ -35,7 +35,7 @@ jobs:
         run: python main.py
       - name: Verificar la salida antes de publicar
         run: python -m src.verificacion site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
